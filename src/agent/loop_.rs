@@ -10,7 +10,7 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -3517,7 +3517,8 @@ pub async fn run(
         };
 
         let mut history = if let Some(path) = session_state_file.as_deref() {
-            let mut h = load_interactive_session_history(path, &system_prompt)?;
+            let mut h = load_interactive_session_history(path, &system_prompt)
+                .with_context(|| format!("failed to load serial session from {}", path.display()))?;
             h.push(ChatMessage::user(&enriched));
             h
         } else {

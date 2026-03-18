@@ -466,8 +466,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     }
 }
 
-/// Return the shared serial session file path when `heartbeat.serial` is enabled,
-/// or `None` when serial mode is disabled (default).
+/// Return the path to `serial_session.json` in the workspace directory when
+/// `heartbeat.serial` is enabled, or `None` when serial mode is disabled (default).
 fn serial_session_file_for_config(config: &Config) -> Option<std::path::PathBuf> {
     if config.heartbeat.serial {
         Some(config.workspace_dir.join("serial_session.json"))

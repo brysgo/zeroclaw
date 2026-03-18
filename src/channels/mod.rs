@@ -301,6 +301,7 @@ impl InterruptOnNewMessageConfig {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
@@ -340,6 +341,10 @@ struct ChannelRuntimeContext {
     /// approval since no operator is present on channel runs.
     approval_manager: Arc<ApprovalManager>,
     activated_tools: Option<std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// When `true` (i.e. `heartbeat.serial = true`), all channel messages share
+    /// a single conversation history instead of per-sender sessions. All senders
+    /// on all channels funnel into the same history key (`__serial__`).
+    serial: bool,
 }
 
 #[derive(Clone)]
@@ -388,6 +393,20 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     match &msg.thread_ts {
         Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
         None => format!("{}_{}", msg.channel, msg.sender),
+    }
+}
+
+/// The fixed history key used when serial mode is enabled. All senders on all
+/// channels share this single conversation history.
+const SERIAL_HISTORY_KEY: &str = "serial_shared";
+
+/// Resolve the effective history key for a message. When serial mode is on,
+/// all messages use `SERIAL_HISTORY_KEY` regardless of sender or channel.
+fn effective_history_key(msg: &traits::ChannelMessage, serial: bool) -> String {
+    if serial {
+        SERIAL_HISTORY_KEY.to_string()
+    } else {
+        conversation_history_key(msg)
     }
 }
 
@@ -1935,7 +1954,7 @@ async fn process_channel_message(
         return;
     }
 
-    let history_key = conversation_history_key(&msg);
+    let history_key = effective_history_key(&msg, ctx.serial);
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
 
     // ── Query classification: override route when a rule matches ──
@@ -4194,6 +4213,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         },
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
+        serial: config.heartbeat.serial,
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -4487,6 +4507,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4596,6 +4617,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4661,6 +4683,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4745,6 +4768,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -5279,6 +5303,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -5352,6 +5377,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -5439,6 +5465,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -5511,6 +5538,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -5593,6 +5621,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -5696,6 +5725,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -5780,6 +5810,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -5879,6 +5910,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -5963,6 +5995,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -6037,6 +6070,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -6222,6 +6256,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -6315,6 +6350,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6422,6 +6458,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
             query_classification: crate::config::QueryClassificationConfig::default(),
         });
 
@@ -6528,6 +6565,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6615,6 +6653,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -6687,6 +6726,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -7317,6 +7357,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -7415,6 +7456,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -7513,6 +7555,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -8075,6 +8118,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -8154,6 +8198,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -8307,6 +8352,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -8410,6 +8456,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -8505,6 +8552,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -8620,6 +8668,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            serial: false,
         });
 
         process_channel_message(
@@ -8682,5 +8731,62 @@ This is an example JSON object for profile settings."#;
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
         }
+    }
+
+    #[test]
+    fn effective_history_key_serial_mode_returns_constant() {
+        let msg = traits::ChannelMessage {
+            id: "msg1".into(),
+            channel: "telegram".into(),
+            sender: "user123".into(),
+            content: "hello".into(),
+            reply_target: "msg1".into(),
+            timestamp: 0,
+            thread_ts: None,
+        };
+
+        // Without serial mode: per-sender key
+        let key_normal = effective_history_key(&msg, false);
+        assert_eq!(key_normal, "telegram_user123");
+
+        // With serial mode: fixed constant key
+        let key_serial = effective_history_key(&msg, true);
+        assert_eq!(key_serial, SERIAL_HISTORY_KEY);
+
+        // Different senders in serial mode share the same key
+        let msg2 = traits::ChannelMessage {
+            sender: "other_user".into(),
+            ..msg.clone()
+        };
+        assert_eq!(effective_history_key(&msg2, true), SERIAL_HISTORY_KEY);
+
+        // Different channels in serial mode also share the same key
+        let msg3 = traits::ChannelMessage {
+            channel: "discord".into(),
+            ..msg.clone()
+        };
+        assert_eq!(effective_history_key(&msg3, true), SERIAL_HISTORY_KEY);
+    }
+
+    #[test]
+    fn effective_history_key_thread_ts_ignored_in_serial_mode() {
+        let msg = traits::ChannelMessage {
+            id: "msg1".into(),
+            channel: "slack".into(),
+            sender: "alice".into(),
+            content: "hello thread".into(),
+            reply_target: "msg1".into(),
+            timestamp: 0,
+            thread_ts: Some("1234567890.123".into()),
+        };
+
+        // Without serial: thread-scoped key
+        let key_normal = effective_history_key(&msg, false);
+        assert!(key_normal.contains("1234567890.123"));
+        assert!(key_normal.contains("alice"));
+
+        // With serial: constant key regardless of thread
+        let key_serial = effective_history_key(&msg, true);
+        assert_eq!(key_serial, SERIAL_HISTORY_KEY);
     }
 }

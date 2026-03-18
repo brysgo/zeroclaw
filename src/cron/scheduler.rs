@@ -180,7 +180,7 @@ async fn run_agent_job(
     let model_override = job.model.clone();
 
     let session_state_file =
-        session_file_for_target(&job.session_target, &config.workspace_dir);
+        session_file_for_target(&job.session_target, &config.workspace_dir, config.heartbeat.serial);
     let run_result = Box::pin(crate::agent::run(
         config.clone(),
         Some(prefixed_prompt),
@@ -207,15 +207,23 @@ async fn run_agent_job(
     }
 }
 
-/// Return the shared serial session file path for `SessionTarget::Main`, or `None`
-/// for `SessionTarget::Isolated`.
+/// Return the shared serial session file path for `SessionTarget::Main` (always),
+/// or for `SessionTarget::Isolated` when `serial` is `true` (global serial mode).
+/// Returns `None` only for `SessionTarget::Isolated` when serial mode is off.
 fn session_file_for_target(
     target: &SessionTarget,
     workspace_dir: &std::path::Path,
+    serial: bool,
 ) -> Option<std::path::PathBuf> {
     match target {
         SessionTarget::Main => Some(workspace_dir.join("serial_session.json")),
-        SessionTarget::Isolated => None,
+        SessionTarget::Isolated => {
+            if serial {
+                Some(workspace_dir.join("serial_session.json"))
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -862,13 +870,17 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let expected = workspace.join("serial_session.json");
 
-        // Main target must resolve to the shared serial session file
-        let path = session_file_for_target(&SessionTarget::Main, &workspace);
+        // Main target always resolves to the shared serial session file
+        let path = session_file_for_target(&SessionTarget::Main, &workspace, false);
         assert_eq!(path.as_deref(), Some(expected.as_path()));
 
-        // Isolated target must produce no session file
-        let path_for_isolated = session_file_for_target(&SessionTarget::Isolated, &workspace);
+        // Isolated target with serial=false produces no session file
+        let path_for_isolated = session_file_for_target(&SessionTarget::Isolated, &workspace, false);
         assert!(path_for_isolated.is_none());
+
+        // Isolated target with serial=true (global serial mode) also uses serial session
+        let path_serial = session_file_for_target(&SessionTarget::Isolated, &workspace, true);
+        assert_eq!(path_serial.as_deref(), Some(expected.as_path()));
     }
 
     #[tokio::test]
