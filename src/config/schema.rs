@@ -3994,6 +3994,7 @@ pub struct ClassificationRule {
 // ── Heartbeat ────────────────────────────────────────────────────
 
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HeartbeatConfig {
     /// Enable periodic heartbeat pings. Default: `false`.
@@ -4040,6 +4041,13 @@ pub struct HeartbeatConfig {
     /// Maximum number of heartbeat run history records to retain. Default: `100`.
     #[serde(default = "default_heartbeat_max_run_history")]
     pub max_run_history: u32,
+    /// Run heartbeat tasks in a shared persistent session (`serial_session.json`)
+    /// instead of fresh isolated sessions. When enabled, each heartbeat tick
+    /// injects its task prompt as a new message into a single long-running
+    /// conversation, giving the LLM context from prior ticks. Cron jobs with
+    /// `session_target = "main"` also share this session. Default: `false`.
+    #[serde(default)]
+    pub serial: bool,
 }
 
 fn default_two_phase() -> bool {
@@ -4074,6 +4082,7 @@ impl Default for HeartbeatConfig {
             deadman_channel: None,
             deadman_to: None,
             max_run_history: default_heartbeat_max_run_history(),
+            serial: false,
         }
     }
 }
@@ -8213,6 +8222,20 @@ mod tests {
         assert!(h.message.is_none());
         assert!(h.target.is_none());
         assert!(h.to.is_none());
+        assert!(!h.serial);
+    }
+
+    #[test]
+    async fn heartbeat_config_serial_parses() {
+        let raw = r#"
+enabled = true
+interval_minutes = 15
+serial = true
+"#;
+        let parsed: HeartbeatConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.interval_minutes, 15);
+        assert!(parsed.serial);
     }
 
     #[test]

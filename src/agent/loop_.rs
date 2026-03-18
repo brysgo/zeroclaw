@@ -3516,10 +3516,16 @@ pub async fn run(
             format!("{context}[{now}] {msg}")
         };
 
-        let mut history = vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&enriched),
-        ];
+        let mut history = if let Some(path) = session_state_file.as_deref() {
+            let mut h = load_interactive_session_history(path, &system_prompt)?;
+            h.push(ChatMessage::user(&enriched));
+            h
+        } else {
+            vec![
+                ChatMessage::system(&system_prompt),
+                ChatMessage::user(&enriched),
+            ]
+        };
 
         // Compute per-turn excluded MCP tools from tool_filter_groups.
         let excluded_tools =
@@ -3594,6 +3600,9 @@ pub async fn run(
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
+        if let Some(path) = session_state_file.as_deref() {
+            let _ = save_interactive_session_history(path, &history);
+        }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /help for commands.\n");

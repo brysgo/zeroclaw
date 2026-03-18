@@ -231,6 +231,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let delivery = resolve_heartbeat_delivery(&config)?;
     let two_phase = config.heartbeat.two_phase;
     let adaptive = config.heartbeat.adaptive;
+    let serial_session_file = serial_session_file_for_config(&config);
     let start_time = std::time::Instant::now();
 
     // ── Deadman watcher ──────────────────────────────────────────
@@ -372,7 +373,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 temp,
                 vec![],
                 false,
-                None,
+                serial_session_file.clone(),
                 None,
             ))
             .await
@@ -462,6 +463,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         } else {
             sleep_mins = base_interval;
         }
+    }
+}
+
+/// Return the shared serial session file path when `heartbeat.serial` is enabled,
+/// or `None` when serial mode is disabled (default).
+fn serial_session_file_for_config(config: &Config) -> Option<std::path::PathBuf> {
+    if config.heartbeat.serial {
+        Some(config.workspace_dir.join("serial_session.json"))
+    } else {
+        None
     }
 }
 
@@ -586,6 +597,30 @@ mod tests {
 
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("daemon_state.json"));
+    }
+
+    #[test]
+    fn serial_session_file_path_uses_workspace_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.heartbeat.serial = true;
+
+        let path = serial_session_file_for_config(&config);
+        assert_eq!(
+            path.as_deref(),
+            Some(config.workspace_dir.join("serial_session.json").as_path())
+        );
+    }
+
+    #[test]
+    fn serial_session_file_none_when_serial_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        // serial defaults to false
+        assert!(!config.heartbeat.serial);
+
+        let path = serial_session_file_for_config(&config);
+        assert!(path.is_none());
     }
 
     #[tokio::test]

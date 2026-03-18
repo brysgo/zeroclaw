@@ -179,22 +179,20 @@ async fn run_agent_job(
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
-    let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(crate::agent::run(
-                config.clone(),
-                Some(prefixed_prompt),
-                None,
-                model_override,
-                config.default_temperature,
-                vec![],
-                false,
-                None,
-                job.allowed_tools.clone(),
-            ))
-            .await
-        }
-    };
+    let session_state_file =
+        session_file_for_target(&job.session_target, &config.workspace_dir);
+    let run_result = Box::pin(crate::agent::run(
+        config.clone(),
+        Some(prefixed_prompt),
+        None,
+        model_override,
+        config.default_temperature,
+        vec![],
+        false,
+        session_state_file,
+        job.allowed_tools.clone(),
+    ))
+    .await;
 
     match run_result {
         Ok(response) => (
@@ -206,6 +204,18 @@ async fn run_agent_job(
             },
         ),
         Err(e) => (false, format!("agent job failed: {e}")),
+    }
+}
+
+/// Return the shared serial session file path for `SessionTarget::Main`, or `None`
+/// for `SessionTarget::Isolated`.
+fn session_file_for_target(
+    target: &SessionTarget,
+    workspace_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    match target {
+        SessionTarget::Main => Some(workspace_dir.join("serial_session.json")),
+        SessionTarget::Isolated => None,
     }
 }
 
@@ -828,6 +838,37 @@ mod tests {
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_main_session_target_fails_without_provider_key() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        job.session_target = SessionTarget::Main;
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
+        assert!(!success);
+        assert!(output.contains("agent job failed:"));
+    }
+
+    #[test]
+    fn run_agent_job_main_uses_serial_session_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let expected = workspace.join("serial_session.json");
+
+        // Main target must resolve to the shared serial session file
+        let path = session_file_for_target(&SessionTarget::Main, &workspace);
+        assert_eq!(path.as_deref(), Some(expected.as_path()));
+
+        // Isolated target must produce no session file
+        let path_for_isolated = session_file_for_target(&SessionTarget::Isolated, &workspace);
+        assert!(path_for_isolated.is_none());
     }
 
     #[tokio::test]
