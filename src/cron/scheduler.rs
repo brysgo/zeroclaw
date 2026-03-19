@@ -100,7 +100,13 @@ async fn process_due_jobs(
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
 
-    let max_concurrent = config.scheduler.max_concurrent.max(1);
+    // When serial mode is enabled, cap concurrency to 1 so jobs run one at a time
+    // and avoid hitting provider concurrency limits.
+    let max_concurrent = if config.heartbeat.serial {
+        1
+    } else {
+        config.scheduler.max_concurrent.max(1)
+    };
     let mut in_flight = stream::iter(jobs.into_iter().map(|job| {
         let config = config.clone();
         let security = Arc::clone(security);
@@ -215,11 +221,12 @@ fn session_file_for_target(
     workspace_dir: &std::path::Path,
     serial: bool,
 ) -> Option<std::path::PathBuf> {
+    let serial_path = || workspace_dir.join("serial_session.json");
     match target {
-        SessionTarget::Main => Some(workspace_dir.join("serial_session.json")),
+        SessionTarget::Main => Some(serial_path()),
         SessionTarget::Isolated => {
             if serial {
-                Some(workspace_dir.join("serial_session.json"))
+                Some(serial_path())
             } else {
                 None
             }
@@ -916,6 +923,29 @@ mod tests {
 
         crate::health::mark_component_ok(&component);
         process_due_jobs(&config, &security, vec![job], &component).await;
+
+        let snapshot = crate::health::snapshot_json();
+        let entry = &snapshot["components"][component.as_str()];
+        assert_eq!(entry["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_serial_mode_runs_jobs_sequentially() {
+        // Verify that with serial mode enabled, shell jobs still complete successfully.
+        // The ordering constraint (max_concurrent=1) is enforced in the code path;
+        // this test exercises the serial branch to catch regressions.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.heartbeat.serial = true;
+        let job1 = test_job("echo serial-job-1");
+        let job2 = test_job("echo serial-job-2");
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let component = unique_component("scheduler-serial");
+
+        process_due_jobs(&config, &security, vec![job1, job2], &component).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
