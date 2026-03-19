@@ -22,7 +22,10 @@ const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(
+    config: Config,
+    serial_lock: Option<Arc<tokio::sync::Semaphore>>,
+) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -47,7 +50,14 @@ pub async fn run(config: Config) -> Result<()> {
             }
         };
 
-        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
+        process_due_jobs(
+            &config,
+            &security,
+            jobs,
+            SCHEDULER_COMPONENT,
+            serial_lock.as_ref().map(Arc::clone),
+        )
+        .await;
     }
 }
 
@@ -96,6 +106,7 @@ async fn process_due_jobs(
     security: &Arc<SecurityPolicy>,
     jobs: Vec<CronJob>,
     component: &str,
+    serial_lock: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
@@ -111,7 +122,20 @@ async fn process_due_jobs(
         let config = config.clone();
         let security = Arc::clone(security);
         let component = component.to_owned();
+        let lock = serial_lock.as_ref().map(Arc::clone);
         async move {
+            // Acquire the shared serial execution lock (if in serial mode) before running
+            // the job so that cron jobs and channel messages are mutually exclusive.
+            let _permit = if let Some(ref l) = lock {
+                Some(
+                    l.clone()
+                        .acquire_owned()
+                        .await
+                        .expect("serial semaphore closed"),
+                )
+            } else {
+                None
+            };
             Box::pin(execute_and_persist_job(
                 &config,
                 security.as_ref(),
@@ -901,7 +925,7 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, &security, Vec::new(), &component).await;
+        process_due_jobs(&config, &security, Vec::new(), &component, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -922,7 +946,7 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, &security, vec![job], &component).await;
+        process_due_jobs(&config, &security, vec![job], &component, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -931,9 +955,9 @@ mod tests {
 
     #[tokio::test]
     async fn process_due_jobs_serial_mode_runs_jobs_sequentially() {
-        // Verify that with serial mode enabled, shell jobs still complete successfully.
-        // The ordering constraint (max_concurrent=1) is enforced in the code path;
-        // this test exercises the serial branch to catch regressions.
+        // Verify that with serial mode enabled and a shared serial lock, shell jobs still
+        // complete successfully. The shared lock is the mechanism that prevents channel
+        // messages from running concurrently with cron jobs.
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.heartbeat.serial = true;
@@ -944,8 +968,9 @@ mod tests {
             &config.workspace_dir,
         ));
         let component = unique_component("scheduler-serial");
+        let serial_lock = Some(Arc::new(tokio::sync::Semaphore::new(1)));
 
-        process_due_jobs(&config, &security, vec![job1, job2], &component).await;
+        process_due_jobs(&config, &security, vec![job1, job2], &component, serial_lock).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];

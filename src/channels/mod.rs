@@ -2665,8 +2665,15 @@ async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
     max_in_flight_messages: usize,
+    serial_lock: Option<Arc<tokio::sync::Semaphore>>,
 ) {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
+    // In serial mode use the shared cross-component semaphore (capacity 1) so that
+    // channel messages, cron jobs, and heartbeat tasks are mutually exclusive.
+    // In normal mode create a local semaphore sized to max_in_flight_messages.
+    let semaphore = match serial_lock {
+        Some(lock) => lock,
+        None => Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages)),
+    };
     let mut workers = tokio::task::JoinSet::new();
     let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
         String,
@@ -3799,7 +3806,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
-pub async fn start_channels(config: Config) -> Result<()> {
+pub async fn start_channels(
+    config: Config,
+    serial_lock: Option<Arc<tokio::sync::Semaphore>>,
+) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -4242,7 +4252,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages, serial_lock).await;
 
     // Wait for all channel tasks
     for h in handles {
@@ -6291,7 +6301,7 @@ BTC is currently around $65,000 based on latest tool output."#
         drop(tx);
 
         let started = Instant::now();
-        run_message_dispatch_loop(rx, runtime_ctx, 2).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 2, None).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -6306,8 +6316,8 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn message_dispatch_serial_mode_processes_messages_one_at_a_time() {
-        // With max_in_flight=1, two messages must complete sequentially.
-        // Each provider call takes 100ms, so sequential completion >= 200ms.
+        // With the shared serial semaphore (capacity 1), two messages must complete
+        // sequentially — the same semaphore that cron/heartbeat hold while running.
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -6383,11 +6393,116 @@ BTC is currently around $65,000 based on latest tool output."#
         .unwrap();
         drop(tx);
 
-        // Serial mode (max_in_flight=1): both messages must complete
-        run_message_dispatch_loop(rx, runtime_ctx, 1).await;
+        // Use the real shared semaphore (capacity 1) that channels receive from the daemon.
+        let serial_lock = Arc::new(tokio::sync::Semaphore::new(1));
+        run_message_dispatch_loop(rx, runtime_ctx, 1, Some(serial_lock)).await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 2, "both messages should be processed");
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_blocks_on_shared_serial_lock_held_by_external_holder() {
+        // Simulate a cron/heartbeat job holding the shared serial lock while a channel
+        // message arrives.  The channel message must NOT be processed until the external
+        // holder releases the permit.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel.clone());
+
+        let serial_lock = Arc::new(tokio::sync::Semaphore::new(1));
+        // Simulate an external "cron job" holding the lock.
+        let external_permit = serial_lock.clone().acquire_owned().await.unwrap();
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(10),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            serial: true,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
+        tx.send(traits::ChannelMessage {
+            id: "1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "alice".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        // Start the dispatch loop in the background.
+        let channel_impl_clone = channel_impl.clone();
+        let dispatch_lock = Arc::clone(&serial_lock);
+        let dispatch = tokio::spawn(async move {
+            run_message_dispatch_loop(rx, runtime_ctx, 1, Some(dispatch_lock)).await;
+        });
+
+        // Give the loop a moment to receive the message and block on the semaphore.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The message should NOT have been processed yet — the external holder still
+        // holds the permit.
+        let messages_while_locked = channel_impl_clone.sent_messages.lock().await.len();
+        assert_eq!(
+            messages_while_locked, 0,
+            "channel message should not be processed while external serial lock is held"
+        );
+
+        // Release the "cron job" permit — the channel message can now proceed.
+        drop(external_permit);
+
+        dispatch.await.unwrap();
+
+        let sent_messages = channel_impl_clone.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            1,
+            "channel message should complete after serial lock is released"
+        );
     }
 
     #[tokio::test]
@@ -6472,7 +6587,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4, None).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -6581,7 +6696,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4, None).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -6687,7 +6802,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4, None).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;

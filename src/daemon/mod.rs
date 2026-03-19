@@ -3,6 +3,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
@@ -60,6 +61,16 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 .await;
     }
 
+    // When serial mode is on, create a single shared semaphore (capacity 1) that is
+    // shared between the channel dispatch loop, the heartbeat worker, and the cron
+    // scheduler. This guarantees that only one LLM call is in-flight at a time across
+    // ALL components, so users never receive provider concurrency limit errors.
+    let serial_lock: Option<Arc<tokio::sync::Semaphore>> = if config.heartbeat.serial {
+        Some(Arc::new(tokio::sync::Semaphore::new(1)))
+    } else {
+        None
+    };
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     {
@@ -80,13 +91,15 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
+            let serial_for_channels = serial_lock.as_ref().map(Arc::clone);
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
                 max_backoff,
                 move || {
                     let cfg = channels_cfg.clone();
-                    async move { Box::pin(crate::channels::start_channels(cfg)).await }
+                    let lock = serial_for_channels.as_ref().map(Arc::clone);
+                    async move { Box::pin(crate::channels::start_channels(cfg, lock)).await }
                 },
             ));
         } else {
@@ -97,26 +110,30 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
+        let serial_for_heartbeat = serial_lock.as_ref().map(Arc::clone);
         handles.push(spawn_component_supervisor(
             "heartbeat",
             initial_backoff,
             max_backoff,
             move || {
                 let cfg = heartbeat_cfg.clone();
-                async move { Box::pin(run_heartbeat_worker(cfg)).await }
+                let lock = serial_for_heartbeat.as_ref().map(Arc::clone);
+                async move { Box::pin(run_heartbeat_worker(cfg, lock)).await }
             },
         ));
     }
 
     if config.cron.enabled {
         let scheduler_cfg = config.clone();
+        let serial_for_scheduler = serial_lock.as_ref().map(Arc::clone);
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
             max_backoff,
             move || {
                 let cfg = scheduler_cfg.clone();
-                async move { Box::pin(crate::cron::scheduler::run(cfg)).await }
+                let lock = serial_for_scheduler.as_ref().map(Arc::clone);
+                async move { Box::pin(crate::cron::scheduler::run(cfg, lock)).await }
             },
         ));
     } else {
@@ -214,7 +231,10 @@ where
     })
 }
 
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
+async fn run_heartbeat_worker(
+    config: Config,
+    serial_lock: Option<Arc<tokio::sync::Semaphore>>,
+) -> Result<()> {
     use crate::heartbeat::engine::{
         compute_adaptive_interval, HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus,
     };
@@ -317,6 +337,17 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         // ── Phase 1: LLM decision (two-phase mode) ──────────────
         let tasks_to_run = if two_phase {
             let decision_prompt = HeartbeatEngine::build_decision_prompt(&tasks);
+            // Acquire the shared serial execution lock for the duration of the LLM call so
+            // that channel messages cannot start a parallel provider request.
+            let permit = if let Some(ref l) = serial_lock {
+                Some(
+                    l.acquire()
+                        .await
+                        .expect("serial semaphore closed (phase 1)"),
+                )
+            } else {
+                None
+            };
             match Box::pin(crate::agent::run(
                 config.clone(),
                 Some(decision_prompt),
@@ -331,6 +362,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             .await
             {
                 Ok(response) => {
+                    drop(permit);
                     let indices = HeartbeatEngine::parse_decision_response(&response, tasks.len());
                     if indices.is_empty() {
                         tracing::info!("💓 Heartbeat Phase 1: skip (nothing to do)");
@@ -351,6 +383,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         .collect()
                 }
                 Err(e) => {
+                    drop(permit);
                     tracing::warn!("💓 Heartbeat Phase 1 failed, running all tasks: {e}");
                     tasks
                 }
@@ -365,6 +398,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             let task_start = std::time::Instant::now();
             let prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
             let temp = config.default_temperature;
+            // Acquire the shared serial execution lock for the duration of the LLM call.
+            let permit = if let Some(ref l) = serial_lock {
+                Some(
+                    l.acquire()
+                        .await
+                        .expect("serial semaphore closed (phase 2)"),
+                )
+            } else {
+                None
+            };
             match Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prompt),
@@ -379,6 +422,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             .await
             {
                 Ok(output) => {
+                    drop(permit); // Release the serial lock before delivery/recording
                     crate::health::mark_component_ok("heartbeat");
                     #[allow(clippy::cast_possible_truncation)]
                     let duration_ms = task_start.elapsed().as_millis() as i64;
@@ -417,6 +461,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    drop(permit); // Release the serial lock before recording
                     tick_had_error = true;
                     #[allow(clippy::cast_possible_truncation)]
                     let duration_ms = task_start.elapsed().as_millis() as i64;
