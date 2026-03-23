@@ -34,6 +34,8 @@ pub struct DelegateTool {
     parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+    /// Global platform configuration (for serial mode check).
+    config: Option<Arc<crate::config::Config>>,
 }
 
 impl DelegateTool {
@@ -47,6 +49,7 @@ impl DelegateTool {
             fallback_credential,
             security,
             providers::ProviderRuntimeOptions::default(),
+            None,
         )
     }
 
@@ -55,6 +58,7 @@ impl DelegateTool {
         fallback_credential: Option<String>,
         security: Arc<SecurityPolicy>,
         provider_runtime_options: providers::ProviderRuntimeOptions,
+        config: Option<Arc<crate::config::Config>>,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
@@ -64,6 +68,7 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            config,
         }
     }
 
@@ -82,6 +87,7 @@ impl DelegateTool {
             security,
             depth,
             providers::ProviderRuntimeOptions::default(),
+            None,
         )
     }
 
@@ -91,6 +97,7 @@ impl DelegateTool {
         security: Arc<SecurityPolicy>,
         depth: u32,
         provider_runtime_options: providers::ProviderRuntimeOptions,
+        config: Option<Arc<crate::config::Config>>,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
@@ -100,6 +107,7 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            config,
         }
     }
 
@@ -393,10 +401,32 @@ impl DelegateTool {
             });
         }
 
-        let mut history = Vec::new();
-        if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
-            history.push(ChatMessage::system(system_prompt.clone()));
-        }
+        let mut history = if let Some(ref config) = self.config {
+            if config.is_serial() {
+                let path = config.serial_session_path();
+                crate::agent::loop_::load_interactive_session_history(&path, agent_config.system_prompt.as_deref().unwrap_or(""))
+                    .unwrap_or_else(|_| {
+                        let mut h = Vec::new();
+                        if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
+                            h.push(ChatMessage::system(system_prompt.clone()));
+                        }
+                        h
+                    })
+            } else {
+                let mut h = Vec::new();
+                if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
+                    h.push(ChatMessage::system(system_prompt.clone()));
+                }
+                h
+            }
+        } else {
+            let mut h = Vec::new();
+            if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
+                h.push(ChatMessage::system(system_prompt.clone()));
+            }
+            h
+        };
+
         history.push(ChatMessage::user(full_prompt.to_string()));
 
         let noop_observer = NoopObserver;
@@ -423,9 +453,14 @@ impl DelegateTool {
                 &[],
                 None,
                 None,
+                self.config.as_deref(),
             ),
         )
         .await;
+
+        if self.config.as_ref().is_some_and(|c| c.is_serial()) {
+             crate::agent::loop_::maybe_save_serial_history(self.config.as_deref(), &history);
+        }
 
         match result {
             Ok(Ok(response)) => {

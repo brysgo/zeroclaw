@@ -598,6 +598,7 @@ pub fn all_tools_with_runtime(
             delegate_fallback_credential.clone(),
             security.clone(),
             provider_runtime_options.clone(),
+            Some(Arc::clone(&config)),
         )
         .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone());
@@ -617,6 +618,7 @@ pub fn all_tools_with_runtime(
             delegate_fallback_credential,
             security.clone(),
             provider_runtime_options,
+            Some(config.clone()),
         )));
     }
 

@@ -1037,6 +1037,14 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     while turns.len() > MAX_CHANNEL_HISTORY {
         turns.remove(0);
     }
+
+    // When serial mode is on, also update the global serial_session.json file.
+    if ctx.serial && sender_key == SERIAL_HISTORY_KEY {
+        let path = ctx.workspace_dir.join("serial_session.json");
+        if let Err(e) = crate::agent::loop_::save_interactive_session_history(&path, turns) {
+            tracing::warn!("Failed to update global serial session file: {e}");
+        }
+    }
 }
 
 fn rollback_orphan_user_turn(
@@ -1069,6 +1077,16 @@ fn rollback_orphan_user_turn(
     if let Some(ref store) = ctx.session_store {
         if let Err(e) = store.remove_last(sender_key) {
             tracing::warn!("Failed to rollback session store entry: {e}");
+        }
+    }
+
+    // When serial mode is on, also update the global serial_session.json file.
+    if ctx.serial && sender_key == SERIAL_HISTORY_KEY {
+        let path = ctx.workspace_dir.join("serial_session.json");
+        let empty_history = Vec::new();
+        let turns_to_save = histories.get(sender_key).unwrap_or(&empty_history);
+        if let Err(e) = crate::agent::loop_::save_interactive_session_history(&path, turns_to_save) {
+            tracing::warn!("Failed to update global serial session file during rollback: {e}");
         }
     }
 
@@ -4232,21 +4250,38 @@ pub async fn start_channels(
         serial: config.heartbeat.serial,
     });
 
-    // Hydrate in-memory conversation histories from persisted JSONL session files.
+    // Hydrate in-memory conversation histories from persisted session storage.
+    let mut hydrated = 0usize;
     if let Some(ref store) = runtime_ctx.session_store {
-        let mut hydrated = 0usize;
         let mut histories = runtime_ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+
+        // When serial mode is on, hydrate the global shared session from its JSON file.
+        if config.heartbeat.serial {
+            let path = config.serial_session_path();
+            if path.exists() {
+                if let Ok(history) = crate::agent::loop_::load_interactive_session_history(&path, &system_prompt) {
+                    tracing::info!(path = %path.display(), "Hydrated global serial session");
+                    histories.insert(SERIAL_HISTORY_KEY.to_string(), history);
+                    hydrated += 1;
+                }
+            }
+        }
+
+        // Hydrate other sessions from JSONL store.
         for key in store.list_sessions() {
+            // Skip hydration of serial key from JSONL if we already loaded it from JSON
+            if config.heartbeat.serial && key == SERIAL_HISTORY_KEY {
+                continue;
+            }
             let msgs = store.load(&key);
             if !msgs.is_empty() {
                 hydrated += 1;
                 histories.insert(key, msgs);
             }
         }
-        drop(histories);
         if hydrated > 0 {
             tracing::info!("📂 Restored {hydrated} session(s) from disk");
         }

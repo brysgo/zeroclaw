@@ -76,6 +76,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
+        let serial_for_gateway = serial_lock.as_ref().map(Arc::clone);
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -83,7 +84,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { Box::pin(crate::gateway::run_gateway(&host, port, cfg)).await }
+                let lock = serial_for_gateway.as_ref().map(Arc::clone);
+                async move { Box::pin(crate::gateway::run_gateway(&host, port, cfg, lock)).await }
             },
         ));
     }

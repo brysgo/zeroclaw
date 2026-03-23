@@ -341,11 +341,18 @@ pub struct AppState {
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
+    /// Shared semaphore for serial execution mode.
+    pub serial_lock: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
-pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
+pub async fn run_gateway(
+    host: &str,
+    port: u16,
+    config: Config,
+    serial_lock: Option<Arc<tokio::sync::Semaphore>>,
+) -> Result<()> {
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
@@ -734,6 +741,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         session_backend,
         device_registry,
         pending_pairings,
+        serial_lock,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -1005,6 +1013,12 @@ async fn run_gateway_chat_with_tools(
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
+    let _permit = if let Some(ref lock) = state.serial_lock {
+        Some(lock.acquire().await.context("serial lock failed")?)
+    } else {
+        None
+    };
+
     let config = state.config.lock().clone();
     Box::pin(crate::agent::process_message(config, message, session_id)).await
 }

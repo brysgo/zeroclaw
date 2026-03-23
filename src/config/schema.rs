@@ -59,6 +59,18 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 // ── Top-level config ──────────────────────────────────────────────
 
+impl Config {
+    /// Returns true if the platform is operating in serial mode (global shared session).
+    pub fn is_serial(&self) -> bool {
+        self.heartbeat.serial
+    }
+
+    /// Returns the absolute path to the global serial session file.
+    pub fn serial_session_path(&self) -> PathBuf {
+        self.workspace_dir.join("serial_session.json")
+    }
+}
+
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
 /// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.

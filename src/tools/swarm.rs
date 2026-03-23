@@ -20,6 +20,8 @@ pub struct SwarmTool {
     security: Arc<SecurityPolicy>,
     fallback_credential: Option<String>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
+    /// Global platform configuration (for serial mode check).
+    config: Option<Arc<crate::config::Config>>,
 }
 
 impl SwarmTool {
@@ -29,6 +31,7 @@ impl SwarmTool {
         fallback_credential: Option<String>,
         security: Arc<SecurityPolicy>,
         provider_runtime_options: providers::ProviderRuntimeOptions,
+        config: Option<Arc<crate::config::Config>>,
     ) -> Self {
         Self {
             swarms: Arc::new(swarms),
@@ -36,6 +39,7 @@ impl SwarmTool {
             security,
             fallback_credential,
             provider_runtime_options,
+            config,
         }
     }
 
@@ -180,86 +184,123 @@ impl SwarmTool {
             format!("[Context]\n{context}\n\n[Task]\n{prompt}")
         };
 
-        let mut join_set = tokio::task::JoinSet::new();
-
-        for agent_name in &swarm_config.agents {
-            let agent_config = match self.agents.get(agent_name) {
-                Some(cfg) => cfg.clone(),
-                None => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Swarm references unknown agent '{agent_name}'")),
-                    });
-                }
-            };
-
-            let credential = agent_config
-                .api_key
-                .clone()
-                .or_else(|| self.fallback_credential.clone());
-
-            let provider = match providers::create_provider_with_options(
-                &agent_config.provider,
-                credential.as_deref(),
-                &self.provider_runtime_options,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!(
-                            "Failed to create provider for agent '{agent_name}': {e}"
-                        )),
-                    });
-                }
-            };
-
-            let name = agent_name.clone();
-            let prompt_clone = full_prompt.clone();
-            let timeout = swarm_config.timeout_secs;
-            let model = agent_config.model.clone();
-            let temperature = agent_config.temperature.unwrap_or(0.7);
-            let system_prompt = agent_config.system_prompt.clone();
-            let provider_name = agent_config.provider.clone();
-
-            join_set.spawn(async move {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(timeout),
-                    provider.chat_with_system(
-                        system_prompt.as_deref(),
-                        &prompt_clone,
-                        &model,
-                        temperature,
-                    ),
-                )
-                .await;
-
-                let output = match result {
-                    Ok(Ok(text)) => {
-                        if text.trim().is_empty() {
-                            "[Empty response]".to_string()
-                        } else {
-                            text
-                        }
-                    }
-                    Ok(Err(e)) => format!("[Error] {e}"),
-                    Err(_) => format!("[Timed out after {timeout}s]"),
-                };
-
-                (name, provider_name, model, output)
-            });
-        }
+        // When serial mode is on, we cannot run sub-agents in parallel because
+        // they must share the single execution thread/lock and potentially
+        // the shared history file.
+        let serial = self.config.as_ref().is_some_and(|c| c.is_serial());
 
         let mut results = Vec::new();
-        while let Some(join_result) = join_set.join_next().await {
-            match join_result {
-                Ok((name, provider_name, model, output)) => {
-                    results.push(format!("[{name} ({provider_name}/{model})]\n{output}"));
-                }
-                Err(e) => {
-                    results.push(format!("[join error] {e}"));
+
+        if serial {
+            tracing::info!("🚦 Serial mode: executing parallel swarm strategy sequentially");
+            for agent_name in &swarm_config.agents {
+                let agent_config = match self.agents.get(agent_name) {
+                    Some(cfg) => cfg,
+                    None => {
+                        results.push(format!("[{agent_name}] Swarm references unknown agent"));
+                        continue;
+                    }
+                };
+
+                let output = match self
+                    .call_agent(
+                        agent_name,
+                        agent_config,
+                        &full_prompt,
+                        swarm_config.timeout_secs,
+                    )
+                    .await
+                {
+                    Ok(text) => text,
+                    Err(e) => format!("[Error] {e}"),
+                };
+
+                results.push(format!(
+                    "[{agent_name} ({}/{})]\n{output}",
+                    agent_config.provider, agent_config.model
+                ));
+            }
+        } else {
+            let mut join_set = tokio::task::JoinSet::new();
+
+            for agent_name in &swarm_config.agents {
+                let agent_config = match self.agents.get(agent_name) {
+                    Some(cfg) => cfg.clone(),
+                    None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Swarm references unknown agent '{agent_name}'")),
+                        });
+                    }
+                };
+
+                let credential = agent_config
+                    .api_key
+                    .clone()
+                    .or_else(|| self.fallback_credential.clone());
+
+                let provider = match providers::create_provider_with_options(
+                    &agent_config.provider,
+                    credential.as_deref(),
+                    &self.provider_runtime_options,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Failed to create provider for agent '{agent_name}': {e}"
+                            )),
+                        });
+                    }
+                };
+
+                let name = agent_name.clone();
+                let prompt_clone = full_prompt.clone();
+                let timeout = swarm_config.timeout_secs;
+                let model = agent_config.model.clone();
+                let temperature = agent_config.temperature.unwrap_or(0.7);
+                let system_prompt = agent_config.system_prompt.clone();
+                let provider_name = agent_config.provider.clone();
+
+                join_set.spawn(async move {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(timeout),
+                        provider.chat_with_system(
+                            system_prompt.as_deref(),
+                            &prompt_clone,
+                            &model,
+                            temperature,
+                        ),
+                    )
+                    .await;
+
+                    let output = match result {
+                        Ok(Ok(text)) => {
+                            if text.trim().is_empty() {
+                                "[Empty response]".to_string()
+                            } else {
+                                text
+                            }
+                        }
+                        Ok(Err(e)) => format!("[Error] {e}"),
+                        Err(_) => format!("[Timed out after {timeout}s]"),
+                    };
+
+                    (name, provider_name, model, output)
+                });
+            }
+
+            while let Some(join_result) = join_set.join_next().await {
+                match join_result {
+                    Ok((name, provider_name, model, output)) => {
+                        results.push(format!("[{name} ({provider_name}/{model})]\n{output}"));
+                    }
+                    Err(e) => {
+                        results.push(format!("[join error] {e}"));
+                    }
                 }
             }
         }
@@ -267,7 +308,8 @@ impl SwarmTool {
         Ok(ToolResult {
             success: true,
             output: format!(
-                "[Swarm parallel — {} agents]\n\n{}",
+                "[Swarm {} — {} agents]\n\n{}",
+                if serial { "serialized" } else { "parallel" },
                 swarm_config.agents.len(),
                 results.join("\n\n---\n\n")
             ),
@@ -628,6 +670,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         assert_eq!(tool.name(), "swarm");
         let schema = tool.parameters_schema();
@@ -648,6 +691,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         assert!(!tool.description().is_empty());
     }
@@ -660,6 +704,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["swarm"]["description"]
@@ -676,6 +721,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["swarm"]["description"]
@@ -692,6 +738,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool
             .execute(json!({"swarm": "nonexistent", "prompt": "test"}))
@@ -709,6 +756,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool.execute(json!({"prompt": "test"})).await;
         assert!(result.is_err());
@@ -722,6 +770,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool.execute(json!({"swarm": "pipeline"})).await;
         assert!(result.is_err());
@@ -735,6 +784,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool
             .execute(json!({"swarm": "  ", "prompt": "test"}))
@@ -752,6 +802,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool
             .execute(json!({"swarm": "pipeline", "prompt": "  "}))
@@ -780,6 +831,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool
             .execute(json!({"swarm": "broken", "prompt": "test"}))
@@ -808,6 +860,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool
             .execute(json!({"swarm": "empty", "prompt": "test"}))
@@ -829,6 +882,7 @@ mod tests {
             None,
             readonly,
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool
             .execute(json!({"swarm": "pipeline", "prompt": "test"}))
@@ -854,6 +908,7 @@ mod tests {
             None,
             limited,
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool
             .execute(json!({"swarm": "pipeline", "prompt": "test"}))
@@ -887,6 +942,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool
             .execute(json!({"swarm": "seq", "prompt": "test"}))
@@ -915,6 +971,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool
             .execute(json!({"swarm": "par", "prompt": "test"}))
@@ -943,6 +1000,7 @@ mod tests {
             None,
             test_security(),
             providers::ProviderRuntimeOptions::default(),
+            None,
         );
         let result = tool
             .execute(json!({"swarm": "rout", "prompt": "test"}))
