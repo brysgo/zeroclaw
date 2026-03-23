@@ -345,6 +345,8 @@ struct ChannelRuntimeContext {
     /// a single conversation history instead of per-sender sessions. All senders
     /// on all channels funnel into the same history key (`__serial__`).
     serial: bool,
+    /// Root configuration.
+    config: Arc<crate::config::Config>,
 }
 
 #[derive(Clone)]
@@ -2289,6 +2291,7 @@ async fn process_channel_message(
                 ctx.tool_call_dedup_exempt.as_ref(),
                 ctx.activated_tools.as_ref(),
                 None,
+                Some(ctx.config.as_ref()),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -4191,7 +4194,7 @@ pub async fn start_channels(
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
         observer,
-        system_prompt: Arc::new(system_prompt),
+        system_prompt: Arc::new(system_prompt.clone()),
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
@@ -4248,6 +4251,7 @@ pub async fn start_channels(
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
         serial: config.heartbeat.serial,
+        config: Arc::new(config.clone()),
     });
 
     // Hydrate in-memory conversation histories from persisted session storage.

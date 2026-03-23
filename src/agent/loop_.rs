@@ -228,22 +228,26 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
 const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
 /// Keep this many most-recent non-system messages after compaction.
-const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
+/// Minimum messages to protect from compaction if they fit in budget.
+const COMPACTION_MIN_KEEP_MESSAGES: usize = 4;
+
+/// Target percentage of the context budget to reserve for "un-compacted" recent messages.
+const COMPACTION_KEEP_BUDGET_PCT: f64 = 0.30;
 
 /// Safety cap for compaction source transcript passed to the summarizer.
 const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 
 /// Max characters retained in stored compaction summary.
-const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
+const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_500;
 
-/// Estimate token count for a message history using ~4 chars/token heuristic.
+/// Estimate token count for a message history using a conservative ~3 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
 fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     history
         .iter()
         .map(|m| {
-            // ~4 chars per token + ~4 framing tokens per message (role, delimiters)
-            m.content.len().div_ceil(4) + 4
+            // ~3 chars per token (safer for code/non-English) + ~8 framing tokens
+            m.content.len().div_ceil(3) + 8
         })
         .sum()
 }
@@ -359,23 +363,63 @@ async fn auto_compact_history(
         history.len()
     };
 
-    let estimated_tokens = estimate_history_tokens(history);
+    let total_estimated_tokens = estimate_history_tokens(history);
 
-    // Trigger compaction when either token budget OR message count is exceeded.
-    if estimated_tokens <= max_context_tokens && non_system_count <= max_history {
+    // If we are within both budget and count limits, nothing to do.
+    if total_estimated_tokens <= max_context_tokens && non_system_count <= max_history {
+        return Ok(false);
+    }
+
+    // ── Emergency Truncation ───────────────────────────────────────
+    // If the history is massively over budget, the "recent" messages themselves
+    // might be the problem. We truncate large tool outputs in the last 5 turns.
+    if total_estimated_tokens > (max_context_tokens + 5000) {
+        let mut modified = false;
+        let start_idx = history.len().saturating_sub(5);
+        for i in start_idx..history.len() {
+            if history[i].content.len() > 10_000 {
+                // Truncate huge tool results or logs to ~2000 tokens (6000 chars)
+                history[i].content = truncate_with_ellipsis(&history[i].content, 6000);
+                modified = true;
+            }
+        }
+        if modified {
+            tracing::warn!("⚠️ Emergency truncation applied to large messages in history");
+        }
+    }
+
+    // ── Dynamic Window Calculation ──────────────────────────────────
+    // Determine how many messages we can "keep" (un-summarized) while staying
+    // within the reserved budget percentage.
+    let keep_budget = (max_context_tokens as f64 * COMPACTION_KEEP_BUDGET_PCT) as usize;
+    let mut kept_tokens = 0;
+    let mut kept_count = 0;
+
+    for msg in history.iter().rev() {
+        if msg.role == "system" { continue; }
+        let tokens = estimate_history_tokens(std::slice::from_ref(msg));
+        if (kept_tokens + tokens) > keep_budget && kept_count >= COMPACTION_MIN_KEEP_MESSAGES {
+            break;
+        }
+        kept_tokens += tokens;
+        kept_count += 1;
+    }
+
+    let compact_count = non_system_count.saturating_sub(kept_count);
+    if compact_count == 0 {
+        // If we still can't compact because the 'kept' messages are too large,
+        // we force a harder trim of the oldest non-system messages.
+        if total_estimated_tokens > max_context_tokens {
+            trim_history(history, max_history.min(10));
+            return Ok(true);
+        }
         return Ok(false);
     }
 
     let start = if has_system { 1 } else { 0 };
-    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES.min(non_system_count);
-    let compact_count = non_system_count.saturating_sub(keep_recent);
-    if compact_count == 0 {
-        return Ok(false);
-    }
-
     let mut compact_end = start + compact_count;
 
-    // Snap compact_end to a user-turn boundary so we don't split mid-conversation.
+    // Snap compact_end to a user-turn boundary to maintain conversation flow.
     while compact_end > start && history.get(compact_end).map_or(false, |m| m.role != "user") {
         compact_end -= 1;
     }
@@ -386,18 +430,13 @@ async fn auto_compact_history(
     let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
     let transcript = build_compaction_transcript(&to_compact);
 
-    let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
-
-    let summarizer_user = format!(
-        "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{}",
-        transcript
-    );
+    let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into bullet points. Preserve: user preferences, decisions, and key technical facts. Omit: tool logs, repeated chit-chat.";
+    let summarizer_user = format!("Summarize this history (max 12 points):\n\n{}", transcript);
 
     let summary_raw = provider
         .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
         .await
         .unwrap_or_else(|_| {
-            // Fallback to deterministic local truncation when summarization fails.
             truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
         });
 
@@ -422,7 +461,7 @@ impl InteractiveSessionState {
     }
 }
 
-fn load_interactive_session_history(path: &Path, system_prompt: &str) -> Result<Vec<ChatMessage>> {
+pub(crate) fn load_interactive_session_history(path: &Path, system_prompt: &str) -> Result<Vec<ChatMessage>> {
     if !path.exists() {
         return Ok(vec![ChatMessage::system(system_prompt)]);
     }
@@ -438,7 +477,7 @@ fn load_interactive_session_history(path: &Path, system_prompt: &str) -> Result<
     Ok(state.history)
 }
 
-fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
+pub(crate) fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -3139,6 +3178,7 @@ pub async fn run(
     interactive: bool,
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
+    ephemeral: bool,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -3499,7 +3539,7 @@ pub async fn run(
     let effective_session_state_file = if session_state_file.is_none() && config.is_serial() {
         Some(config.serial_session_path())
     } else {
-        session_state_file
+        session_state_file.clone()
     };
 
     if let Some(msg) = message {
@@ -3860,8 +3900,10 @@ pub async fn run(
             // Hard cap as a safety net.
             trim_history(&mut history, config.agent.max_history_messages);
 
-            if let Some(path) = session_state_file.as_deref() {
-                save_interactive_session_history(path, &history)?;
+            if let Some(path) = effective_session_state_file.as_deref() {
+                if !ephemeral {
+                    save_interactive_session_history(path, &history)?;
+                }
             }
         }
     }

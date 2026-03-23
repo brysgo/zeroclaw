@@ -253,7 +253,6 @@ async fn run_heartbeat_worker(
     let delivery = resolve_heartbeat_delivery(&config)?;
     let two_phase = config.heartbeat.two_phase;
     let adaptive = config.heartbeat.adaptive;
-    let serial_session_file = serial_session_file_for_config(&config);
     let start_time = std::time::Instant::now();
 
     // ── Deadman watcher ──────────────────────────────────────────
@@ -360,6 +359,7 @@ async fn run_heartbeat_worker(
                 false,
                 None,
                 None,
+                true, // ephemeral = true
             ))
             .await
             {
@@ -418,8 +418,9 @@ async fn run_heartbeat_worker(
                 temp,
                 vec![],
                 false,
-                serial_session_file.clone(),
                 None,
+                None,
+                false, // ephemeral = false
             ))
             .await
             {

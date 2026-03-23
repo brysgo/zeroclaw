@@ -955,6 +955,7 @@ async fn main() -> Result<()> {
                 true,
                 session_state_file,
                 None,
+                false, // ephemeral = false
             ))
             .await
             .map(|_| ())

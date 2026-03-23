@@ -221,6 +221,7 @@ async fn run_agent_job(
         false,
         session_state_file,
         job.allowed_tools.clone(),
+        false, // ephemeral = false
     ))
     .await;
 
