@@ -10,7 +10,7 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -446,6 +446,18 @@ fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Res
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
     std::fs::write(path, payload)?;
     Ok(())
+}
+
+/// Helper to save history to the global serial session file if enabled in config.
+pub(crate) fn maybe_save_serial_history(config: Option<&Config>, history: &[ChatMessage]) {
+    if let Some(cfg) = config {
+        if cfg.is_serial() {
+            let path = cfg.serial_session_path();
+            if let Err(e) = save_interactive_session_history(&path, history) {
+                tracing::warn!(path = %path.display(), "Failed to auto-save serial history: {e}");
+            }
+        }
+    }
 }
 
 /// Build context preamble by searching memory for relevant entries.
@@ -2185,7 +2197,7 @@ pub(crate) async fn agent_turn(
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    model_switch_callback: Option<ModelSwitchCallback>,
+    config: Option<&Config>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -2206,7 +2218,8 @@ pub(crate) async fn agent_turn(
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
-        model_switch_callback,
+        None,
+        config,
     )
     .await
 }
@@ -2413,6 +2426,7 @@ pub(crate) async fn run_tool_call_loop(
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
+    config: Option<&Config>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2738,6 +2752,7 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
+            maybe_save_serial_history(config, history);
             return Ok(display_text);
         }
 
@@ -3059,6 +3074,7 @@ pub(crate) async fn run_tool_call_loop(
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
         }
+        maybe_save_serial_history(config, history);
     }
 
     runtime_trace::record_event(
@@ -3478,6 +3494,14 @@ pub async fn run(
 
     let mut final_output = String::new();
 
+    // When serial mode is enabled globally, default to the shared serial session
+    // if no explicit session state file was provided (e.g. from CLI override).
+    let effective_session_state_file = if session_state_file.is_none() && config.is_serial() {
+        Some(config.serial_session_path())
+    } else {
+        session_state_file
+    };
+
     if let Some(msg) = message {
         // Auto-save user message to memory (skip short/trivial messages)
         if config.memory.auto_save
@@ -3516,10 +3540,17 @@ pub async fn run(
             format!("{context}[{now}] {msg}")
         };
 
-        let mut history = vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&enriched),
-        ];
+        let mut history = if let Some(path) = effective_session_state_file.as_deref() {
+            let mut h = load_interactive_session_history(path, &system_prompt)
+                .with_context(|| format!("failed to load serial session from {}", path.display()))?;
+            h.push(ChatMessage::user(&enriched));
+            h
+        } else {
+            vec![
+                ChatMessage::system(&system_prompt),
+                ChatMessage::user(&enriched),
+            ]
+        };
 
         // Compute per-turn excluded MCP tools from tool_filter_groups.
         let excluded_tools =
@@ -3548,6 +3579,7 @@ pub async fn run(
                 &config.agent.tool_call_dedup_exempt,
                 activated_handle.as_ref(),
                 Some(model_switch_callback.clone()),
+                Some(&config),
             )
             .await
             {
@@ -3594,6 +3626,9 @@ pub async fn run(
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
+        if let Some(path) = session_state_file.as_deref() {
+            let _ = save_interactive_session_history(path, &history);
+        }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /help for commands.\n");
@@ -3724,6 +3759,7 @@ pub async fn run(
             };
 
             history.push(ChatMessage::user(&enriched));
+            maybe_save_serial_history(Some(&config), &history);
 
             // Compute per-turn excluded MCP tools from tool_filter_groups.
             let excluded_tools = compute_excluded_mcp_tools(
@@ -3753,6 +3789,7 @@ pub async fn run(
                     &config.agent.tool_call_dedup_exempt,
                     activated_handle.as_ref(),
                     Some(model_switch_callback.clone()),
+                    Some(&config),
                 )
                 .await
                 {
@@ -4081,10 +4118,19 @@ pub async fn process_message(
         format!("{context}[{now}] {message}")
     };
 
-    let mut history = vec![
-        ChatMessage::system(&system_prompt),
-        ChatMessage::user(&enriched),
-    ];
+    let mut history = if config.is_serial() {
+        let path = config.serial_session_path();
+        let mut h = load_interactive_session_history(&path, &system_prompt)
+            .unwrap_or_else(|_| vec![ChatMessage::system(&system_prompt)]);
+        h.push(ChatMessage::user(&enriched));
+        h
+    } else {
+        vec![
+            ChatMessage::system(&system_prompt),
+            ChatMessage::user(&enriched),
+        ]
+    };
+
     let excluded_tools =
         compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, message);
 
@@ -4103,7 +4149,7 @@ pub async fn process_message(
         &excluded_tools,
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
-        None,
+        Some(&config),
     )
     .await
 }
@@ -4562,6 +4608,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4611,6 +4658,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4652,6 +4700,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -4783,6 +4832,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -4855,6 +4905,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4923,6 +4974,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -4980,6 +5032,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
             None,
             None,
         )
@@ -5061,6 +5114,7 @@ mod tests {
             &exempt,
             None,
             None,
+            None,
         )
         .await
         .expect("loop should complete");
@@ -5115,6 +5169,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )
@@ -7076,6 +7131,7 @@ Let me check the result."#;
             None,
             &[],
             &[],
+            None,
             None,
             None,
         )

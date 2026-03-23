@@ -22,7 +22,10 @@ const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(
+    config: Config,
+    serial_lock: Option<Arc<tokio::sync::Semaphore>>,
+) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -47,7 +50,14 @@ pub async fn run(config: Config) -> Result<()> {
             }
         };
 
-        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
+        process_due_jobs(
+            &config,
+            &security,
+            jobs,
+            SCHEDULER_COMPONENT,
+            serial_lock.as_ref().map(Arc::clone),
+        )
+        .await;
     }
 }
 
@@ -96,16 +106,36 @@ async fn process_due_jobs(
     security: &Arc<SecurityPolicy>,
     jobs: Vec<CronJob>,
     component: &str,
+    serial_lock: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
 
-    let max_concurrent = config.scheduler.max_concurrent.max(1);
+    // When serial mode is enabled, cap concurrency to 1 so jobs run one at a time
+    // and avoid hitting provider concurrency limits.
+    let max_concurrent = if config.heartbeat.serial {
+        1
+    } else {
+        config.scheduler.max_concurrent.max(1)
+    };
     let mut in_flight = stream::iter(jobs.into_iter().map(|job| {
         let config = config.clone();
         let security = Arc::clone(security);
         let component = component.to_owned();
+        let lock = serial_lock.as_ref().map(Arc::clone);
         async move {
+            // Acquire the shared serial execution lock (if in serial mode) before running
+            // the job so that cron jobs and channel messages are mutually exclusive.
+            let _permit = if let Some(ref l) = lock {
+                Some(
+                    l.clone()
+                        .acquire_owned()
+                        .await
+                        .expect("serial semaphore closed"),
+                )
+            } else {
+                None
+            };
             Box::pin(execute_and_persist_job(
                 &config,
                 security.as_ref(),
@@ -179,22 +209,20 @@ async fn run_agent_job(
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
-    let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(crate::agent::run(
-                config.clone(),
-                Some(prefixed_prompt),
-                None,
-                model_override,
-                config.default_temperature,
-                vec![],
-                false,
-                None,
-                job.allowed_tools.clone(),
-            ))
-            .await
-        }
-    };
+    let session_state_file =
+        session_file_for_target(&job.session_target, &config.workspace_dir, config.heartbeat.serial);
+    let run_result = Box::pin(crate::agent::run(
+        config.clone(),
+        Some(prefixed_prompt),
+        None,
+        model_override,
+        config.default_temperature,
+        vec![],
+        false,
+        session_state_file,
+        job.allowed_tools.clone(),
+    ))
+    .await;
 
     match run_result {
         Ok(response) => (
@@ -206,6 +234,27 @@ async fn run_agent_job(
             },
         ),
         Err(e) => (false, format!("agent job failed: {e}")),
+    }
+}
+
+/// Return the shared serial session file path for `SessionTarget::Main` (always),
+/// or for `SessionTarget::Isolated` when `serial` is `true` (global serial mode).
+/// Returns `None` only for `SessionTarget::Isolated` when serial mode is off.
+fn session_file_for_target(
+    target: &SessionTarget,
+    workspace_dir: &std::path::Path,
+    serial: bool,
+) -> Option<std::path::PathBuf> {
+    let serial_path = || workspace_dir.join("serial_session.json");
+    match target {
+        SessionTarget::Main => Some(serial_path()),
+        SessionTarget::Isolated => {
+            if serial {
+                Some(serial_path())
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -831,6 +880,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_agent_job_main_session_target_fails_without_provider_key() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        job.session_target = SessionTarget::Main;
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
+        assert!(!success);
+        assert!(output.contains("agent job failed:"));
+    }
+
+    #[test]
+    fn run_agent_job_main_uses_serial_session_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let expected = workspace.join("serial_session.json");
+
+        // Main target always resolves to the shared serial session file
+        let path = session_file_for_target(&SessionTarget::Main, &workspace, false);
+        assert_eq!(path.as_deref(), Some(expected.as_path()));
+
+        // Isolated target with serial=false produces no session file
+        let path_for_isolated = session_file_for_target(&SessionTarget::Isolated, &workspace, false);
+        assert!(path_for_isolated.is_none());
+
+        // Isolated target with serial=true (global serial mode) also uses serial session
+        let path_serial = session_file_for_target(&SessionTarget::Isolated, &workspace, true);
+        assert_eq!(path_serial.as_deref(), Some(expected.as_path()));
+    }
+
+    #[tokio::test]
     async fn process_due_jobs_marks_component_ok_even_when_idle() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -841,7 +925,7 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, &security, Vec::new(), &component).await;
+        process_due_jobs(&config, &security, Vec::new(), &component, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -862,7 +946,31 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, &security, vec![job], &component).await;
+        process_due_jobs(&config, &security, vec![job], &component, None).await;
+
+        let snapshot = crate::health::snapshot_json();
+        let entry = &snapshot["components"][component.as_str()];
+        assert_eq!(entry["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_serial_mode_runs_jobs_sequentially() {
+        // Verify that with serial mode enabled and a shared serial lock, shell jobs still
+        // complete successfully. The shared lock is the mechanism that prevents channel
+        // messages from running concurrently with cron jobs.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.heartbeat.serial = true;
+        let job1 = test_job("echo serial-job-1");
+        let job2 = test_job("echo serial-job-2");
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let component = unique_component("scheduler-serial");
+        let serial_lock = Some(Arc::new(tokio::sync::Semaphore::new(1)));
+
+        process_due_jobs(&config, &security, vec![job1, job2], &component, serial_lock).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];

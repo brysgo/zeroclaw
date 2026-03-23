@@ -39,6 +39,7 @@ use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -908,7 +909,7 @@ async fn main() -> Result<()> {
 
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
-            Box::pin(channels::start_channels(config)).await?;
+            Box::pin(channels::start_channels(config, None)).await?;
         }
         return Ok(());
     }
@@ -960,6 +961,11 @@ async fn main() -> Result<()> {
         }
 
         Commands::Gateway { gateway_command } => {
+            let serial_lock = if config.heartbeat.serial {
+                Some(Arc::new(tokio::sync::Semaphore::new(1)))
+            } else {
+                None
+            };
             match gateway_command {
                 Some(zeroclaw::GatewayCommands::Restart { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
@@ -995,7 +1001,7 @@ async fn main() -> Result<()> {
                     }
 
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, serial_lock)).await
                 }
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
@@ -1044,13 +1050,13 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::Start { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, serial_lock)).await
                 }
                 None => {
                     let port = config.gateway.port;
                     let host = config.gateway.host.clone();
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, serial_lock)).await
                 }
             }
         }
@@ -1278,7 +1284,7 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => Box::pin(channels::start_channels(config)).await,
+            ChannelCommands::Start => Box::pin(channels::start_channels(config, None)).await,
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
         },
